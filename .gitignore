@@ -134,6 +134,7 @@ celerybeat.pid
 .env
 .venv
 env/
+envs/
 venv/
 ENV/
 env.bak/
@@ -195,3 +196,6 @@ data/*
 # Store for models and glove
 models/
 ontomatch/glove/
+
+# vscode
+.vscode/
