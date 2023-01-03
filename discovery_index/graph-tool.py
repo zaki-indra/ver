@@ -2,10 +2,11 @@ import json
 import os
 from pathlib import Path
 import time
-from typing import Union
+from typing import Union, List
 import random
 from argparse import ArgumentParser
 
+from datasketch import MinHash, MinHashLSH
 from graph_tool import Graph, topology, search
 from graph_tool.all import graph_draw
 import matplotlib.pyplot as plt
@@ -13,6 +14,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from yaspin import yaspin
+import duckdb
 
 
 class VertexProperty:
@@ -65,10 +67,50 @@ class DiscoveryGraph:
     def __init__(self, data_dir: str=".") -> None:
         self.graph = Graph(directed=False)
 
+        #FIXME: don't hard code minhash permutation
+        self.minhash_perm = 512
+
         self.graph.vertex_properties["profile"] = self.graph.new_vertex_property("python::object")
         self.graph.edge_properties["profile"] = self.graph.new_edge_property("python::object")
 
         self.parse_dir(data_dir)
+        self.make_similarity_edges()
+
+
+
+    def make_similarity_edges(self, threshold: int=0.5):
+        ''''
+        Construct the graph (edges) based on minHash signatures of the nodes
+        '''
+        content_index = MinHashLSH(threshold, num_perm=self.minhash_perm)
+        
+        df = pd.DataFrame(columns=["id", "minhash"])
+        df.astype("object")
+        id_to_index = {}
+        start_time = time.time()
+
+        #FIXME: try to make this loop more efficient 
+        for vertex in self.graph.iter_vertices():
+            vertex_id = self.graph.vertex_properties.profile[vertex].profile["id"]
+            minhash = self.graph.vertex_properties.profile[vertex].profile["minhash"]
+
+            id_to_index[vertex_id] = vertex
+            
+            temp = pd.Series({"id": vertex_id, "minhash": MinHash(self.minhash_perm, hashvalues=minhash)})
+            df = pd.concat([df, temp.to_frame().T], ignore_index=True)
+
+        df.apply(lambda row : content_index.insert(row['id'],
+                                                   row['minhash']), axis=1)
+        spent_time = time.time() - start_time
+        print(f'Indexed all minHash signatures: Took {spent_time}')
+
+        for _, row in df.iterrows():
+            neighbors = content_index.query(row['minhash'])
+            for neighbor in neighbors:
+                # TODO: Need to check that they are not from the same source
+                from_vertex = id_to_index[row["id"]]
+                to_vertex = id_to_index[neighbor]
+                self.add_edge(from_vertex, to_vertex)
 
     def parse_dir(self, data_dir: Union[Path, str]):
         '''
