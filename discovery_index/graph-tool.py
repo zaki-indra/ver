@@ -103,7 +103,7 @@ class DiscoveryGraph:
 
     def add_vertex(self, profile: VertexProperty):
         '''
-        Adds a single node, representing a column, into the nodes graph
+        Adds a single vertex with column properties
         '''
 
         vertex = self.graph.add_vertex()
@@ -250,9 +250,8 @@ def test_scalability():
 
 def main(args):
     print(args.path)
-    dg = DiscoveryGraph(args.path)
+    discovery_graph = DiscoveryGraph(args.path)
 
-    pass
 
 if __name__ == "__main__":
     parser = ArgumentParser(
