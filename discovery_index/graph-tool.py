@@ -14,18 +14,27 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from yaspin import yaspin
-import duckdb
+
+
+class BaseException(Exception):
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+
+class DirectoryError(BaseException):
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+
+class FileError(BaseException):
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
 
 
 class VertexProperty:
     def __init__(self, profile) -> None:
         self.profile = profile
-
-
-class EdgeProperty:
-    #TODO: implement this
-    def __init__(self) -> None:
-        pass
 
 
 class NeighborhoodVisitor(search.BFSVisitor):
@@ -67,15 +76,14 @@ class DiscoveryGraph:
     def __init__(self, data_dir: str=".") -> None:
         self.graph = Graph(directed=False)
 
-        #FIXME: don't hard code minhash permutation
-        self.minhash_perm = 512
+        self.minhash_perm = None
 
         self.graph.vertex_properties["profile"] = self.graph.new_vertex_property("python::object")
+        self.graph.vertex_properties["minhash"] = self.graph.new_vertex_property("python::object")
         self.graph.edge_properties["profile"] = self.graph.new_edge_property("python::object")
 
         self.parse_dir(data_dir)
         self.make_similarity_edges()
-
 
 
     def make_similarity_edges(self, threshold: int=0.5):
@@ -89,28 +97,36 @@ class DiscoveryGraph:
         id_to_index = {}
         start_time = time.time()
 
-        #FIXME: try to make this loop more efficient 
         for vertex in self.graph.iter_vertices():
             vertex_id = self.graph.vertex_properties.profile[vertex].profile["id"]
-            minhash = self.graph.vertex_properties.profile[vertex].profile["minhash"]
+            minhash = self.graph.vertex_properties.minhash[vertex]
 
-            id_to_index[vertex_id] = vertex
+            if minhash is not None:
+                id_to_index[vertex_id] = vertex
             
-            temp = pd.Series({"id": vertex_id, "minhash": MinHash(self.minhash_perm, hashvalues=minhash)})
-            df = pd.concat([df, temp.to_frame().T], ignore_index=True)
+                temp = pd.Series({"id": vertex_id, "minhash": minhash})
+                df = pd.concat([df, temp.to_frame().T], ignore_index=True)
 
         df.apply(lambda row : content_index.insert(row['id'],
                                                    row['minhash']), axis=1)
         spent_time = time.time() - start_time
         print(f'Indexed all minHash signatures: Took {spent_time}')
 
+        vertex_pair = set()
         for _, row in df.iterrows():
             neighbors = content_index.query(row['minhash'])
             for neighbor in neighbors:
-                # TODO: Need to check that they are not from the same source
                 from_vertex = id_to_index[row["id"]]
                 to_vertex = id_to_index[neighbor]
-                self.add_edge(from_vertex, to_vertex)
+
+                # No more than 1 edge connecting between two vertices
+                pair = self.helper(int(from_vertex), int(to_vertex))
+                if pair not in vertex_pair:
+                    vertex_pair.add(pair)
+                    self.add_edge(from_vertex, to_vertex)
+
+    def helper(self, a: int, b: int):
+        return (a, b) if a < b else (b, a)
 
     def parse_dir(self, data_dir: Union[Path, str]):
         '''
@@ -118,15 +134,15 @@ class DiscoveryGraph:
         '''
         data_dir = Path(data_dir)
         if not data_dir.is_dir():
-            #FIXME: Create appropriate exception
-            raise FileNotFoundError("The current path is not a directory")
+            raise DirectoryError("The current path is not a directory")
 
         for filename in os.listdir(data_dir):
             filepath = os.path.join(data_dir, filename)
             data = self.parse_json_file(filepath)
 
-            #FIXME: Refactor later
             vertex_prop = VertexProperty(data)
+            if data["minhash"] is not None:
+                self.minhash_perm = len(data["minhash"])
             self.add_vertex(vertex_prop)
 
     def parse_json_file(self, file_path: Union[Path, str]):
@@ -140,8 +156,7 @@ class DiscoveryGraph:
                 sp.write(f"Finished reading {file_path}")
             return data
         else:
-            #FIXME: Create appropriate exception
-            raise FileNotFoundError(f"{file_path} is not a valid JSON file")
+            raise FileError(f"{file_path} is not a valid JSON file")
 
     def add_vertex(self, profile: VertexProperty):
         '''
@@ -150,6 +165,8 @@ class DiscoveryGraph:
 
         vertex = self.graph.add_vertex()
         self.graph.vertex_properties.profile[vertex] = profile
+        if profile.profile["minhash"] is not None:
+            self.graph.vertex_properties.minhash[vertex] = MinHash(self.minhash_perm, hashvalues=profile.profile["minhash"])
         return vertex
 
     def add_node_test(self, num_vertices:int=1) -> None:
@@ -164,7 +181,7 @@ class DiscoveryGraph:
         '''
         Add edge from `from_vertex` to `to_vertex`
         '''
-        #TODO: Add edge properties
+
         graph = self.graph
         edge = graph.add_edge(graph.vertex(from_vertex), graph.vertex(to_vertex))
         return edge
@@ -172,7 +189,6 @@ class DiscoveryGraph:
     def find_neighborhood(self, vertex, hops):
         num_vertices = self.graph.num_vertices(True)
 
-        #TODO: add more relevant properties
         name = np.arange(num_vertices)
         hop = np.empty(num_vertices, np.int32)
         pred = np.empty(num_vertices, np.int32)
@@ -187,19 +203,6 @@ class DiscoveryGraph:
         search.bfs_search(self.graph, self.graph.vertex(vertex), NeighborhoodVisitor(hops, name, pred, hop))
         
         return np.where((hop <= hops) & (hop >= 0))
-
-    #TODO: Implement neighbor search recursively using vertex .all_neighbors() method
-    def find_neighborhood2(self, vertex, hops):
-        vertex = self.graph.vertex(vertex)
-        if hops < 0:
-            raise Exception()
-        if hops == 0:
-            return vertex
-
-        vertices = [vertex]
-        hop = 1
-        vertices.append(vertex.all_neighbors())
-
 
     def find_all_paths(self, from_vertex, to_vertex):
         return topology.all_paths(self.graph, self.graph.vertex(from_vertex), self.graph.vertex(to_vertex))
@@ -290,9 +293,12 @@ def test_scalability():
             plt.savefig(f'{title}.png')
         sp.write("DONE!")
 
+
 def main(args):
     print(args.path)
     discovery_graph = DiscoveryGraph(args.path)
+    if args.save is not None:
+        discovery_graph.graph.save(f"{args.save}.gt", "gt")
 
 
 if __name__ == "__main__":
@@ -301,6 +307,7 @@ if __name__ == "__main__":
         description = 'Builds the Entreprise Knowledge Graph')
     parser.add_argument("-p", "--path", help="Directory of JSON profile")
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("-s", "--save", help="Save path")
     args = parser.parse_args()
     if args.benchmark:
         test_scalability()
