@@ -1,10 +1,15 @@
+from argparse import ArgumentParser
 from datetime import datetime
 from enum import Enum
+import json
+import os
+from pathlib import Path
 import random
 import sys
 import time
 from typing import Union, Optional
 
+from datasketch import MinHash, MinHashLSH, LeanMinHash
 import duckdb
 import matplotlib.pyplot as plt
 import networkit as nk
@@ -14,9 +19,6 @@ from sqlalchemy import create_engine
 from tqdm import tqdm
 from yaspin import yaspin
 
-
-# We should create config for this
-DATABASE_URL = "sqlite:///networkit.db"
 
 class StoreType(Enum):
     """
@@ -36,10 +38,10 @@ class DatabaseEngine:
         """
         self.database = database
         if self.database == "duckdb":
-            self.conn = self._init_duckdb(store_type)
+            self.__conn = self._init_duckdb(store_type)
 
         elif self.database == "sqlite":
-            self.conn = self._init_sqlite(store_type)
+            self.__conn = self._init_sqlite(store_type)
 
     def _init_duckdb(self, store_type: StoreType="local") -> duckdb.DuckDBPyConnection:
         """
@@ -59,56 +61,127 @@ class DatabaseEngine:
             return self.engine.connect()
 
     def execute(self, query: str, *args, **kwargs):
-        return self.conn.execute(query, *args, **kwargs)
+        return self.__conn.execute(query, *args, **kwargs)
+
+    @property
+    def connection(self):
+        return self.__conn
         
 
 class DiscoveryGraph:
 
-    def __init__(self, debug: bool=False) -> None:
+    def __init__(self, data_dir: str=".", debug: bool=False) -> None:
         self.graph = nk.Graph()
 
-        v_id = self.graph.attachNodeAttribute("vertex_id", str)
-        minhash = self.graph.attachNodeAttribute("minhash", float)
+        self.minhash_perm = None
 
-        self.engine = create_engine(DATABASE_URL)
+        self.vertex_id = self.graph.attachNodeAttribute("vertex_id", float)
+        self.minhash = self.graph.attachNodeAttribute("minhash", float)
 
         if debug:
             return
-        
-        with self.engine.connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE nodes (
-                    id              DECIMAL(18, 0) NOT NULL PRIMARY KEY,
-                    dbname          VARCHAR(255),
-                    path            VARCHAR(255),
-                    sourcename      VARCHAR(255),
-                    columnname      VARCHAR(255),
-                    datatype        VARCHAR(255),
-                    totalvalues     INT,
-                    uniquevalues    INT,
-                    nonemptyvalues  INT,
-                    entities        VARCHAR(255),
-                    minhash         BLOB,
-                    minvalue        DECIMAL(18, 4),
-                    maxvalue        DECIMAL(18, 4),
-                    avgvalue        DECIMAL(18, 4),
-                    median          DECIMAL(18, 0),
-                    iqr             DECIMAL(18, 0)
-                )
-                """
-            )
 
-    def add_vertex(self):
-         return self.graph.addNode()
+        self.database = DatabaseEngine(store_type="local")
+        self.conn = self.database.connection
 
-    def add_edge(self, from_vertex: int, to_vertex: int, add_missing: 
+        self.create_table()
+
+        self.parse_dir(data_dir, file_type="json")
+
+    def create_table(self):
+        self.conn.execute(
+            """
+            CREATE OR REPLACE TABLE nodes (
+                id             DECIMAL(18, 0) NOT NULL PRIMARY KEY,
+                dbname         VARCHAR(255),
+                path           VARCHAR(255),
+                sourcename     VARCHAR(255),
+                columnname     VARCHAR(255),
+                datatype       VARCHAR(255),
+                totalvalues    INT,
+                uniquevalues   INT,
+                nonemptyvalues INT,
+                entities       VARCHAR(255),
+                minhash        INTEGER[],
+                minvalue       DECIMAL(18, 4),
+                maxvalue       DECIMAL(18, 4),
+                avgvalue       DECIMAL(18, 4),
+                median         DECIMAL(18, 0),
+                iqr            DECIMAL(18, 0)
+            );
+            CREATE OR REPLACE TABLE edges (
+                from_node DECIMAL(18, 0),
+                to_node   DECIMAL(18, 0),
+                weight    DECIMAL(10, 4)
+            );
+            CREATE OR REPLACE TABLE minhash (
+                id      DECIMAL(18, 0) NOT NULL PRIMARY KEY,
+                minhash BYTEA,
+            );
+            """
+        )
+
+    def parse_dir(self, data_dir: Optional[Union[Path, str]], file_type="json"):
+        '''
+        Parse whole directory of JSON file
+        '''
+        data_dir = Path(data_dir)
+        if not data_dir.is_dir():
+            raise DirectoryError("The current path is not a directory")
+
+        if file_type == "json":
+            self.parse_dir_json(data_dir)
+
+    def parse_dir_json(self, data_dir: Optional[Union[Path, str]]):
+        for filename in os.listdir(data_dir):
+            filepath = os.path.join(data_dir, filename)
+            data = self.parse_json_file(filepath)
+
+            if data["minhash"] is not None and self.minhash_perm is None:
+                self.minhash_perm = len(data["minhash"])
+            self.add_vertex(data)
+
+    def parse_json_file(self, file_path: Union[Path, str]):
+        '''
+        Parse JSON file
+        '''
+        if Path(file_path).suffix == ".json":
+            with open(file_path, 'r', encoding="utf-8") as file, \
+            yaspin(f"Reading {file_path} ...", color="white") as sp:
+                data = json.load(file)
+                sp.write(f"Finished reading {file_path}")
+            return data
+        else:
+            raise FileError(f"{file_path} is not a valid JSON file")
+
+    def add_vertex(self, data: dict):
+        vertex = self._add_vertex()
+        v_id = data.get("id", None)
+        self.vertex_id[vertex] = float(v_id)
+
+        # TODO: precompute minhash
+        if data.get("minhash") is not None:
+            minhash = MinHash(num_perm=self.minhash_perm, hashvalues=data["minhash"])
+
+        # execute db op
+        nodes_table = self.conn.table("nodes")
+        nodes_table.insert(data.values())
+
+        return vertex
+
+    def _add_vertex(self):
+        return self.graph.addNode()
+
+    def add_edge(self, **kwargs):
+        return self._add_edge(**kwargs)
+
+    def _add_edge(self, source: int, target: int, add_missing: 
         bool=False, check_multi_edge: bool=False):
         '''
-        Add edge from `from_vertex` to `to_vertex`
+        Add edge from source to target
         '''
         # TODO: add properties
-        return self.graph.addEdge(from_vertex, to_vertex, addMissing=add_missing)
+        return self.graph.addEdge(source, target, addMissing=add_missing)
 
     def find_shortest_path(self, source, target, return_path: bool=False, return_finder: bool=True):
         pathfinder = nk.distance.BidirectionalBFS(self.graph, source, target)
@@ -206,18 +279,50 @@ def test_scalability():
             plt.savefig(f'{title}.png')
         sp.write("DONE!")
 
+
+def main(args):
+    discovery_graph = DiscoveryGraph(args.path)
+    if args.save is not None:
+        discovery_graph.graph.save(f"{args.save}.gt", "gt")
+
+
 if __name__ == "__main__":
-    test_scalability()
+    parser = ArgumentParser(
+        prog = 'Network Builder',
+        description = 'Builds the Entreprise Knowledge Graph')
+    parser.add_argument("-p", "--path", help="Directory of JSON profile")
+    parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("-s", "--save", help="Save path")
+    args = parser.parse_args()
+    if args.benchmark:
+        test_scalability()
+    main(args)
 
 
 class Logger:
 
     @classmethod
-    def WARN(warning: Optional[str]=None):
+    def WARN(cls, warning: Optional[str]=None):
         now = datetime.now().strftime("%H:%M:%S")
         print(f"[WARNING | {now}] {warning}")
 
     @classmethod
-    def INFO(info: Optional[str]=None):
+    def INFO(cls, info: Optional[str]=None):
         now = datetime.now().strftime("%H:%M:%S")
         print(f"[INFO | {now}] {info}")
+
+
+class BaseException(Exception):
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+
+class DirectoryError(BaseException):
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
+
+class FileError(BaseException):
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*args)
