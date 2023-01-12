@@ -1,19 +1,66 @@
+from datetime import datetime
+from enum import Enum
 import random
 import sys
 import time
 from typing import Union, Optional
 
+import duckdb
 import matplotlib.pyplot as plt
 import networkit as nk
 import numpy as np
 import pandas as pd
+from sqlalchemy import create_engine
 from tqdm import tqdm
 from yaspin import yaspin
 
-graph = nk.Graph()
 
-print(graph.numberOfNodes())
+# We should create config for this
+DATABASE_URL = "sqlite:///networkit.db"
 
+class StoreType(Enum):
+    """
+    Database store type
+    """
+    MEMORY="memory"
+    LOCAL="local"
+    REMOTE="remote"
+
+class DatabaseEngine:
+    """
+    For storing data in the database
+    """
+    def __init__(self, database: str="duckdb", store_type: StoreType="local", debug: bool=False) -> None:
+        """
+        Initiate engine and connection
+        """
+        self.database = database
+        if self.database == "duckdb":
+            self.conn = self._init_duckdb(store_type)
+
+        elif self.database == "sqlite":
+            self.conn = self._init_sqlite(store_type)
+
+    def _init_duckdb(self, store_type: StoreType="local") -> duckdb.DuckDBPyConnection:
+        """
+        init duckdb connection
+        """
+        if store_type == StoreType.LOCAL.value:
+            return duckdb.connect("duck.db", read_only=False)
+        elif store_type == StoreType.MEMORY.value:
+            return duckdb.connect(":memory:")
+
+    def _init_sqlite(self, store_type: StoreType="local"):
+        """
+        init sqlite connection
+        """
+        if store_type == StoreType.LOCAL.value:
+            self.engine = create_engine("sqlite:///sqlite.db")
+            return self.engine.connect()
+
+    def execute(self, query: str, *args, **kwargs):
+        return self.conn.execute(query, *args, **kwargs)
+        
 
 class DiscoveryGraph:
 
@@ -23,9 +70,37 @@ class DiscoveryGraph:
         v_id = self.graph.attachNodeAttribute("vertex_id", str)
         minhash = self.graph.attachNodeAttribute("minhash", float)
 
+        self.engine = create_engine(DATABASE_URL)
+
+        if debug:
+            return
+        
+        with self.engine.connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE nodes (
+                    id              DECIMAL(18, 0) NOT NULL PRIMARY KEY,
+                    dbname          VARCHAR(255),
+                    path            VARCHAR(255),
+                    sourcename      VARCHAR(255),
+                    columnname      VARCHAR(255),
+                    datatype        VARCHAR(255),
+                    totalvalues     INT,
+                    uniquevalues    INT,
+                    nonemptyvalues  INT,
+                    entities        VARCHAR(255),
+                    minhash         BLOB,
+                    minvalue        DECIMAL(18, 4),
+                    maxvalue        DECIMAL(18, 4),
+                    avgvalue        DECIMAL(18, 4),
+                    median          DECIMAL(18, 0),
+                    iqr             DECIMAL(18, 0)
+                )
+                """
+            )
+
     def add_vertex(self):
-        # TODO: add properties
-        return self.graph.addNode()
+         return self.graph.addNode()
 
     def add_edge(self, from_vertex: int, to_vertex: int, add_missing: 
         bool=False, check_multi_edge: bool=False):
@@ -133,4 +208,16 @@ def test_scalability():
 
 if __name__ == "__main__":
     test_scalability()
-        
+
+
+class Logger:
+
+    @classmethod
+    def WARN(warning: Optional[str]=None):
+        now = datetime.now().strftime("%H:%M:%S")
+        print(f"[WARNING | {now}] {warning}")
+
+    @classmethod
+    def INFO(info: Optional[str]=None):
+        now = datetime.now().strftime("%H:%M:%S")
+        print(f"[INFO | {now}] {info}")
