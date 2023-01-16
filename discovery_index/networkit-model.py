@@ -46,6 +46,9 @@ class DatabaseEngine:
         elif self.database == "sqlite":
             self.__conn = self._init_sqlite(store_type)
 
+        elif self.database in ["postgres", "postgresql"]:
+            self.__conn = self._init_postgres(store_type)
+
         else:
             raise Exception(f"{self.database} is not supported yet")
 
@@ -66,6 +69,14 @@ class DatabaseEngine:
             self.engine = create_engine("sqlite:///sqlite.db")
             return self.engine.connect()
 
+    def _init_postgres(self, store_type: StoreType="local"):
+        """
+        init postgres connection
+        """
+        if store_type == StoreType.LOCAL.value:
+            self.engine = create_engine("postgresql://postgres:postgres@localhost:5433/postgres")
+            return self.engine.connect()
+
     def execute(self, query: str, *args, **kwargs):
         return self.__conn.execute(query, *args, **kwargs)
 
@@ -75,11 +86,29 @@ class DatabaseEngine:
             relation.insert(data)
 
         elif self.database == "sqlite":
-            query = ",".join([f"\'{x}\'" for x in data])
-            print("QUERY", query)
+            # TODO: handle integer array
+            query = ""
+            for x in data:
+                print("X", type(x))
+                if isinstance(x, str):
+                    query += f"\'{x}\',"
+                elif isinstance(x, int):
+                    query += f"{x},"
+                elif isinstance(x, float):
+                    query += f"{x},"
+                elif isinstance(x, list):
+                    array = ",".join([str(y) for y in x])
+                    query += f"ARRAY [{array}],"
+            query = query.rstrip(",")
             self.connection.execute(
-                f"INSERT INTO {table} values({data});"
+                f"INSERT INTO {table} values({query});"
             )
+
+        elif self.database == "postgres":
+            insert_param = ("%s,"*len(data)).rstrip(",")
+            self.connection.execute(
+                f"INSERT INTO {table} VALUES({insert_param})",
+            list(data))
 
         else:
             Logger.WARN(f"{self.database} is NOT supported")
@@ -139,9 +168,9 @@ class DiscoveryGraph:
             iqr            DECIMAL(18, 0)
         );
         CREATE TABLE edges (
-            v_id      INTEGER,
-            from_node DECIMAL(18, 0),
-            to_node   DECIMAL(18, 0),
+            e_index   INTEGER,
+            from_node INTEGER,
+            to_node   INTEGER,
             weight    REAL
         );
         CREATE TABLE minhash (
@@ -149,7 +178,7 @@ class DiscoveryGraph:
             minhash   BYTEA
         );
         """
-        for query in queries.split(";"):
+        for query in queries.split(";")[:-1]:
             self.conn.execute(query)
 
     def parse_dir(self, data_dir: Optional[Union[Path, str]], file_type="json"):
@@ -216,15 +245,7 @@ class DiscoveryGraph:
         select v_index, minhash from translationtable as tt, minhash as mh
         where tt.v_id = mh.v_id;
         """
-
-        # df = self.conn.execute(
-        # """
-        # select v_index, minhash from translationtable as tt, minhash as mh
-        # where tt.v_id = mh.v_id;
-        # """
-        # ).df()
         df = pd.read_sql(sql, self.conn)
-        print("DF:", df.head(2))
         
         df["minhash"] = df["minhash"].map(lambda x: pickle.loads(x))
         df.apply(lambda row : content_index.insert(row['v_index'],
@@ -239,8 +260,8 @@ class DiscoveryGraph:
                 source = row["v_index"]
                 target = neighbor
 
-                pair = helper(int(source), int(target))
-                if pair not in vertex_pair:
+                pair = helper(source, target)
+                if pair not in vertex_pair and source != target:
                     vertex_pair.add(pair)
                     self.add_edge(source, target)
 
