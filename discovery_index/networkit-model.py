@@ -4,12 +4,13 @@ from enum import Enum
 import json
 import os
 from pathlib import Path
+import pickle
 import random
 import sys
 import time
 from typing import Union, Optional
 
-from datasketch import MinHash, MinHashLSH, LeanMinHash
+from datasketch import MinHash, MinHashLSH
 import duckdb
 import matplotlib.pyplot as plt
 import networkit as nk
@@ -66,13 +67,15 @@ class DatabaseEngine:
     @property
     def connection(self):
         return self.__conn
-        
+
 
 class DiscoveryGraph:
 
     def __init__(self, data_dir: str=".", debug: bool=False) -> None:
         self.graph = nk.Graph()
+        self.graph.indexEdges()
 
+        self.debug = debug
         self.minhash_perm = None
 
         self.vertex_id = self.graph.attachNodeAttribute("vertex_id", float)
@@ -83,14 +86,19 @@ class DiscoveryGraph:
 
         self.database = DatabaseEngine(store_type="local")
         self.conn = self.database.connection
-
         self.create_table()
 
         self.parse_dir(data_dir, file_type="json")
 
+        self.make_similarity_edges()
+
     def create_table(self):
         self.conn.execute(
             """
+            CREATE OR REPLACE TABLE translationtable (
+                index   INTEGER NOT NULL UNIQUE,
+                id      DECIMAL(18, 0) NOT NULL PRIMARY KEY,
+            );
             CREATE OR REPLACE TABLE nodes (
                 id             DECIMAL(18, 0) NOT NULL PRIMARY KEY,
                 dbname         VARCHAR(255),
@@ -110,9 +118,10 @@ class DiscoveryGraph:
                 iqr            DECIMAL(18, 0)
             );
             CREATE OR REPLACE TABLE edges (
+                id        INTEGER,
                 from_node DECIMAL(18, 0),
                 to_node   DECIMAL(18, 0),
-                weight    DECIMAL(10, 4)
+                weight    REAL,
             );
             CREATE OR REPLACE TABLE minhash (
                 id      DECIMAL(18, 0) NOT NULL PRIMARY KEY,
@@ -152,36 +161,79 @@ class DiscoveryGraph:
                 sp.write(f"Finished reading {file_path}")
             return data
         else:
-            raise FileError(f"{file_path} is not a valid JSON file")
+            raise FileError(f"{file_path} is not a JSON file")
 
     def add_vertex(self, data: dict):
         vertex = self._add_vertex()
         v_id = data.get("id", None)
-        self.vertex_id[vertex] = float(v_id)
 
-        # TODO: precompute minhash
-        if data.get("minhash") is not None:
-            minhash = MinHash(num_perm=self.minhash_perm, hashvalues=data["minhash"])
-
-        # execute db op
         nodes_table = self.conn.table("nodes")
         nodes_table.insert(data.values())
+
+        translation_table = self.conn.table("translationtable")
+        translation_table.insert([vertex, v_id])
+        
+        if data.get("minhash") is not None:            
+            minhash = MinHash(num_perm=self.minhash_perm, hashvalues=data["minhash"])
+            peckle = pickle.dumps(minhash)
+            minhash_table = self.conn.table("minhash")
+            minhash_table.insert([v_id, peckle])
 
         return vertex
 
     def _add_vertex(self):
         return self.graph.addNode()
 
-    def add_edge(self, **kwargs):
-        return self._add_edge(**kwargs)
+    def make_similarity_edges(self, threshold: int=0.5):
+        ''''
+        Construct the graph (edges) based on minHash signatures of the nodes
+        '''
+        def helper(a: int, b: int):
+            return (a, b) if a < b else (b, a)
+
+        content_index = MinHashLSH(threshold, num_perm=self.minhash_perm)
+        start_time = time.time()
+
+        df = self.conn.execute(
+        """
+        select index, minhash from translationtable as tt, minhash as mh
+        where tt.id = mh.id;
+        """
+        ).df()
+        df["minhash"] = df["minhash"].map(lambda x: pickle.loads(x))
+        df.apply(lambda row : content_index.insert(row['index'],
+                                                   row['minhash']), axis=1)
+        spent_time = time.time() - start_time
+        print(f'Indexed all minHash signatures: Took {spent_time}')
+
+        vertex_pair = set()
+        for _, row in df.iterrows():
+            neighbors = content_index.query(row['minhash'])
+            for neighbor in neighbors:
+                source = row["index"]
+                target = neighbor
+
+                pair = helper(int(source), int(target))
+                if pair not in vertex_pair:
+                    vertex_pair.add(pair)
+                    self.add_edge(source, target)
+
+    def add_edge(self, source: int, target: int, **kwargs):
+        edge = self._add_edge(source, target)
+
+        edges_table = self.conn.table('edges')
+        edges_table.insert([edge, source, target, 1])
+        edges_table.insert([edge, target, source, 1])
+
+        return edge
 
     def _add_edge(self, source: int, target: int, add_missing: 
         bool=False, check_multi_edge: bool=False):
         '''
         Add edge from source to target
         '''
-        # TODO: add properties
-        return self.graph.addEdge(source, target, addMissing=add_missing)
+        self.graph.addEdge(source, target, addMissing=add_missing)
+        return self.graph.edgeId(source, target)
 
     def find_shortest_path(self, source, target, return_path: bool=False, return_finder: bool=True):
         pathfinder = nk.distance.BidirectionalBFS(self.graph, source, target)
@@ -208,13 +260,14 @@ class DiscoveryGraph:
 
 def test_graph(num_vertices, sparsity):
     dg = DiscoveryGraph(debug=True)
+    dg.graph.addNodes(num_vertices)
 
     print(f"Generating {num_vertices}^2 random edges with sparsity of {sparsity}")
     start = time.time()
     for i in tqdm(range(num_vertices)):
         for j in range(i + 1, num_vertices):
             if random.random() < sparsity:
-                dg.add_edge(i, j, add_missing=True)
+                dg.graph.addEdge(i, j, addMissing=True)
     print(f"Time elapsed {time.time() - start} s")
     print("=============================================")
 
