@@ -37,12 +37,17 @@ class DatabaseEngine:
         """
         Initiate engine and connection
         """
-        self.database = database
+
+        self.database = "duckdb" if database is None else database.lower()
+
         if self.database == "duckdb":
             self.__conn = self._init_duckdb(store_type)
 
         elif self.database == "sqlite":
             self.__conn = self._init_sqlite(store_type)
+
+        else:
+            raise Exception(f"{self.database} is not supported yet")
 
     def _init_duckdb(self, store_type: StoreType="local") -> duckdb.DuckDBPyConnection:
         """
@@ -64,6 +69,21 @@ class DatabaseEngine:
     def execute(self, query: str, *args, **kwargs):
         return self.__conn.execute(query, *args, **kwargs)
 
+    def insert(self, table, data: list[object]):
+        if self.database == "duckdb":
+            relation = self.connection.table(table)
+            relation.insert(data)
+
+        elif self.database == "sqlite":
+            query = ",".join([f"\'{x}\'" for x in data])
+            print("QUERY", query)
+            self.connection.execute(
+                f"INSERT INTO {table} values({data});"
+            )
+
+        else:
+            Logger.WARN(f"{self.database} is NOT supported")
+
     @property
     def connection(self):
         return self.__conn
@@ -71,20 +91,17 @@ class DatabaseEngine:
 
 class DiscoveryGraph:
 
-    def __init__(self, data_dir: str=".", debug: bool=False) -> None:
+    def __init__(self, data_dir: str=".", database: Optional[str]=None, debug: bool=False) -> None:
         self.graph = nk.Graph()
         self.graph.indexEdges()
 
         self.debug = debug
         self.minhash_perm = None
 
-        self.vertex_id = self.graph.attachNodeAttribute("vertex_id", float)
-        self.minhash = self.graph.attachNodeAttribute("minhash", float)
-
         if debug:
             return
 
-        self.database = DatabaseEngine(store_type="local")
+        self.database = DatabaseEngine(database=database, store_type="local")
         self.conn = self.database.connection
         self.create_table()
 
@@ -93,42 +110,47 @@ class DiscoveryGraph:
         self.make_similarity_edges()
 
     def create_table(self):
-        self.conn.execute(
-            """
-            CREATE OR REPLACE TABLE translationtable (
-                index   INTEGER NOT NULL UNIQUE,
-                id      DECIMAL(18, 0) NOT NULL PRIMARY KEY,
-            );
-            CREATE OR REPLACE TABLE nodes (
-                id             DECIMAL(18, 0) NOT NULL PRIMARY KEY,
-                dbname         VARCHAR(255),
-                path           VARCHAR(255),
-                sourcename     VARCHAR(255),
-                columnname     VARCHAR(255),
-                datatype       VARCHAR(255),
-                totalvalues    INT,
-                uniquevalues   INT,
-                nonemptyvalues INT,
-                entities       VARCHAR(255),
-                minhash        INTEGER[],
-                minvalue       DECIMAL(18, 4),
-                maxvalue       DECIMAL(18, 4),
-                avgvalue       DECIMAL(18, 4),
-                median         DECIMAL(18, 0),
-                iqr            DECIMAL(18, 0)
-            );
-            CREATE OR REPLACE TABLE edges (
-                id        INTEGER,
-                from_node DECIMAL(18, 0),
-                to_node   DECIMAL(18, 0),
-                weight    REAL,
-            );
-            CREATE OR REPLACE TABLE minhash (
-                id      DECIMAL(18, 0) NOT NULL PRIMARY KEY,
-                minhash BYTEA,
-            );
-            """
-        )
+        queries = """
+        DROP TABLE IF EXISTS translationtable;
+        DROP TABLE IF EXISTS nodes;
+        DROP TABLE IF EXISTS edges;
+        DROP TABLE IF EXISTS minhash;
+
+        CREATE TABLE translationtable (
+            v_index   INTEGER NOT NULL UNIQUE,
+            v_id      DECIMAL(18, 0) NOT NULL PRIMARY KEY
+        );
+        CREATE TABLE nodes (
+            v_id           DECIMAL(18, 0) NOT NULL PRIMARY KEY,
+            dbname         VARCHAR(255),
+            path           VARCHAR(255),
+            sourcename     VARCHAR(255),
+            columnname     VARCHAR(255),
+            datatype       VARCHAR(255),
+            totalvalues    INT,
+            uniquevalues   INT,
+            nonemptyvalues INT,
+            entities       VARCHAR(255),
+            minhash        INTEGER[],
+            minvalue       DECIMAL(18, 4),
+            maxvalue       DECIMAL(18, 4),
+            avgvalue       DECIMAL(18, 4),
+            median         DECIMAL(18, 0),
+            iqr            DECIMAL(18, 0)
+        );
+        CREATE TABLE edges (
+            v_id      INTEGER,
+            from_node DECIMAL(18, 0),
+            to_node   DECIMAL(18, 0),
+            weight    REAL
+        );
+        CREATE TABLE minhash (
+            v_id      DECIMAL(18, 0) NOT NULL PRIMARY KEY,
+            minhash   BYTEA
+        );
+        """
+        for query in queries.split(";"):
+            self.conn.execute(query)
 
     def parse_dir(self, data_dir: Optional[Union[Path, str]], file_type="json"):
         '''
@@ -167,17 +189,13 @@ class DiscoveryGraph:
         vertex = self._add_vertex()
         v_id = data.get("id", None)
 
-        nodes_table = self.conn.table("nodes")
-        nodes_table.insert(data.values())
-
-        translation_table = self.conn.table("translationtable")
-        translation_table.insert([vertex, v_id])
+        self.database.insert("nodes", data.values())
+        self.database.insert("translationtable", [vertex, v_id])
         
         if data.get("minhash") is not None:            
             minhash = MinHash(num_perm=self.minhash_perm, hashvalues=data["minhash"])
             peckle = pickle.dumps(minhash)
-            minhash_table = self.conn.table("minhash")
-            minhash_table.insert([v_id, peckle])
+            self.database.insert("minhash", [v_id, peckle])
 
         return vertex
 
@@ -194,14 +212,22 @@ class DiscoveryGraph:
         content_index = MinHashLSH(threshold, num_perm=self.minhash_perm)
         start_time = time.time()
 
-        df = self.conn.execute(
+        sql = """
+        select v_index, minhash from translationtable as tt, minhash as mh
+        where tt.v_id = mh.v_id;
         """
-        select index, minhash from translationtable as tt, minhash as mh
-        where tt.id = mh.id;
-        """
-        ).df()
+
+        # df = self.conn.execute(
+        # """
+        # select v_index, minhash from translationtable as tt, minhash as mh
+        # where tt.v_id = mh.v_id;
+        # """
+        # ).df()
+        df = pd.read_sql(sql, self.conn)
+        print("DF:", df.head(2))
+        
         df["minhash"] = df["minhash"].map(lambda x: pickle.loads(x))
-        df.apply(lambda row : content_index.insert(row['index'],
+        df.apply(lambda row : content_index.insert(row['v_index'],
                                                    row['minhash']), axis=1)
         spent_time = time.time() - start_time
         print(f'Indexed all minHash signatures: Took {spent_time}')
@@ -210,7 +236,7 @@ class DiscoveryGraph:
         for _, row in df.iterrows():
             neighbors = content_index.query(row['minhash'])
             for neighbor in neighbors:
-                source = row["index"]
+                source = row["v_index"]
                 target = neighbor
 
                 pair = helper(int(source), int(target))
@@ -221,9 +247,7 @@ class DiscoveryGraph:
     def add_edge(self, source: int, target: int, **kwargs):
         edge = self._add_edge(source, target)
 
-        edges_table = self.conn.table('edges')
-        edges_table.insert([edge, source, target, 1])
-        edges_table.insert([edge, target, source, 1])
+        self.database.insert("edges", [edge, source, target, 1])
 
         return edge
 
@@ -334,7 +358,7 @@ def test_scalability():
 
 
 def main(args):
-    discovery_graph = DiscoveryGraph(args.path)
+    discovery_graph = DiscoveryGraph(args.path, args.database)
     if args.save is not None:
         discovery_graph.graph.save(f"{args.save}.gt", "gt")
 
@@ -346,6 +370,7 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--path", help="Directory of JSON profile")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("-s", "--save", help="Save path")
+    parser.add_argument("--database", help="Database engine (SQLite, DuckDB, etc)")
     args = parser.parse_args()
     if args.benchmark:
         test_scalability()
