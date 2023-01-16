@@ -120,7 +120,7 @@ class DatabaseEngine:
 
 class DiscoveryGraph:
 
-    def __init__(self, data_dir: str=".", database: Optional[str]=None, debug: bool=False) -> None:
+    def __init__(self, data_dir: str=".", database: Optional[str]=None, debug: bool=False, *args, **kwargs) -> None:
         self.graph = nk.Graph()
         self.graph.indexEdges()
 
@@ -391,7 +391,11 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--path", help="Directory of JSON profile")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("-s", "--save", help="Save path")
-    parser.add_argument("--database", help="Database engine (SQLite, DuckDB, etc)")
+    parser.add_argument("--database", help="Database engine (PostgreSQL, DuckDB, etc.)", default="duckdb", choices=["duckdb", "postgres"])
+    parser.add_argument("--postgres-port", default=5432)
+    parser.add_argument("--postgres-user", default="postgres")
+    parser.add_argument("--postgres-password", default="postgres")
+    parser.add_argument("--postgres-database", default="postgres")
     args = parser.parse_args()
     if args.benchmark:
         test_scalability()
