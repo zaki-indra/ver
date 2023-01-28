@@ -1,21 +1,22 @@
-from argparse import ArgumentParser
-from datetime import datetime
-from enum import Enum
 import json
 import os
-from pathlib import Path
 import pickle
 import random
 import sys
 import time
-from typing import Union, Optional
+from argparse import ArgumentParser
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Optional, Union
 
-from datasketch import MinHash, MinHashLSH
 import duckdb
 import matplotlib.pyplot as plt
 import networkit as nk
 import numpy as np
 import pandas as pd
+import sqlalchemy
+from datasketch import MinHash, MinHashLSH
 from sqlalchemy import create_engine
 from tqdm import tqdm
 from yaspin import yaspin
@@ -56,6 +57,7 @@ class DatabaseEngine:
         """
         init duckdb connection
         """
+        setattr(self, "support_array", True)
         if store_type == StoreType.LOCAL.value:
             return duckdb.connect("duck.db", read_only=False)
         elif store_type == StoreType.MEMORY.value:
@@ -65,14 +67,16 @@ class DatabaseEngine:
         """
         init sqlite connection
         """
+        setattr(self, "support_array", False)
         if store_type == StoreType.LOCAL.value:
             self.engine = create_engine("sqlite:///sqlite.db")
             return self.engine.connect()
 
-    def _init_postgres(self, store_type: StoreType="local"):
+    def _init_postgres(self, store_type: StoreType="local") -> sqlalchemy.engine.Connection:
         """
         init postgres connection
         """
+        setattr(self, "support_array", True)
         if store_type == StoreType.LOCAL.value:
             self.engine = create_engine("postgresql://postgres:postgres@localhost:5433/postgres")
             return self.engine.connect()
@@ -86,23 +90,10 @@ class DatabaseEngine:
             relation.insert(data)
 
         elif self.database == "sqlite":
-            # TODO: handle integer array
-            query = ""
-            for x in data:
-                print("X", type(x))
-                if isinstance(x, str):
-                    query += f"\'{x}\',"
-                elif isinstance(x, int):
-                    query += f"{x},"
-                elif isinstance(x, float):
-                    query += f"{x},"
-                elif isinstance(x, list):
-                    array = ",".join([str(y) for y in x])
-                    query += f"ARRAY [{array}],"
-            query = query.rstrip(",")
-            self.connection.execute(
-                f"INSERT INTO {table} values({query});"
-            )
+            # TODO: Add support for sqlite
+            # current problem:
+            # - Cannot store minhash array, need to find workaround
+            pass
 
         elif self.database == "postgres":
             insert_param = ("%s,"*len(data)).rstrip(",")
@@ -120,7 +111,7 @@ class DatabaseEngine:
 
 class DiscoveryGraph:
 
-    def __init__(self, data_dir: str=".", database: Optional[str]=None, debug: bool=False, *args, **kwargs) -> None:
+    def __init__(self, data_dir: str=".", database: Optional[str]="postgres", debug: bool=False, *args, **kwargs) -> None:
         self.graph = nk.Graph()
         self.graph.indexEdges()
 
@@ -224,7 +215,7 @@ class DiscoveryGraph:
         if data.get("minhash") is not None:            
             minhash = MinHash(num_perm=self.minhash_perm, hashvalues=data["minhash"])
             peckle = pickle.dumps(minhash)
-            self.database.insert("minhash", [v_id, peckle])
+            self.database.insert("minhash", [v_id, peckle]) 
 
         return vertex
 
@@ -283,10 +274,13 @@ class DiscoveryGraph:
     def find_shortest_path(self, source, target, return_path: bool=False, return_finder: bool=True):
         pathfinder = nk.distance.BidirectionalBFS(self.graph, source, target)
         pathfinder.run()
-        is_path_exist = not (pathfinder.getDistance() == sys.float_info.max)
-        if not return_path:
+        is_path_exist = (pathfinder.getDistance() < sys.float_info.max)
+        
+        if return_path:
             temp_path = pathfinder.getPath()
             path = np.array([source] + temp_path + [target])
+        else:
+            path = None
 
         if return_finder:
             return is_path_exist, path, pathfinder
@@ -298,9 +292,12 @@ class DiscoveryGraph:
         neighbor_finder.run()
         distance_array = np.array(neighbor_finder.getDistances(True)).astype(np.int16)
         if return_finder:
-            return distance_array < hop, neighbor_finder
+            return distance_array <= hop, neighbor_finder
         else:
-            return distance_array < hop, None
+            return distance_array <= hop, None
+
+    def save_graph(self):
+        pass
 
 
 def test_graph(num_vertices, sparsity):
@@ -353,29 +350,43 @@ def test_scalability():
     Testing the scalability of finding the 2-hop neighborhood of a node as well
     as finding paths between 2-nodes
     '''
-    nodes = [100, 200, 400, 800, 1600, 3000, 5500, 8000, 10000, 12000, 14000]
+    repetitions = 50
+    nodes = [100, 200, 400, 800, 1600]
     sparsity = [0.1, 0.2]
-    nbhd_result = []
-    path_result = []
+    path_mean = []
+    path_std = []
+    nbhd_mean = []
+    nbhd_std = []
     titles = ['2-hop Neighborhood Search', 'Path Finding']
 
     for n in nodes:
         for s in sparsity:
-            path_time, nbhd_time = test_graph(n, s)
-            nbhd_result.append([n, s, nbhd_time])
-            path_result.append([n, s, path_time])
+            ptime = []
+            ntime = []
+            for _ in range(repetitions):
+                path_time, nbhd_time = test_graph(n, s)
+                ptime.append(path_time)
+                ntime.append(nbhd_time)
+            path_mean.append([n, s, np.mean(ptime), np.std(ptime)])
+            path_std.append([n, s, np.std(ptime)])
+            nbhd_mean.append([n, s, np.mean(ntime), np.std(ntime)])
+            nbhd_std.append([n, s, np.std(ntime)])
 
     with yaspin(text="Generating plot...") as sp:
-        for result, title in zip([nbhd_result, path_result], titles):
-            df = pd.DataFrame(result, columns = ['No. of Nodes', 'Sparsity', 'Time'])
-            df = df.pivot(index='No. of Nodes', columns='Sparsity', values='Time')
+        for result, title in zip([nbhd_mean, path_mean], titles):
+            df = pd.DataFrame(result, columns = ['No. of Nodes', 'Sparsity', 'Time', "std"])
+            df = df.pivot(index='No. of Nodes', columns='Sparsity', values=['Time', 'std'])
             plt.figure()
-            df.plot(title=f'{title} Scalability')
+            df.plot(y="Time", title=f'{title} Scalability')
             plt.xticks(nodes, rotation=90)
             plt.xlabel('No. of Nodes')
             plt.ylabel('Time')
             plt.savefig(f'{title}.png')
         sp.write("DONE!")
+
+
+def test_correctness():
+    pass
 
 
 def main(args):
@@ -388,14 +399,24 @@ if __name__ == "__main__":
     parser = ArgumentParser(
         prog = 'Network Builder',
         description = 'Builds the Entreprise Knowledge Graph')
-    parser.add_argument("-p", "--path", help="Directory of JSON profile")
-    parser.add_argument("--benchmark", action="store_true")
-    parser.add_argument("-s", "--save", help="Save path")
-    parser.add_argument("--database", help="Database engine (PostgreSQL, DuckDB, etc.)", default="duckdb", choices=["duckdb", "postgres"])
-    parser.add_argument("--postgres-port", default=5432)
-    parser.add_argument("--postgres-user", default="postgres")
-    parser.add_argument("--postgres-password", default="postgres")
-    parser.add_argument("--postgres-database", default="postgres")
+    parser.add_argument("-p", "--path", 
+        help="Directory of JSON profile")
+    parser.add_argument("--benchmark", 
+        action="store_true")
+    parser.add_argument("-s", "--save", 
+        help="Save path")
+    parser.add_argument("--database", 
+        help="Database engine (PostgreSQL, DuckDB, etc.)", 
+        default="duckdb", 
+        choices=["duckdb", "postgres"])
+    parser.add_argument("--postgres-port", 
+        default=5432)
+    parser.add_argument("--postgres-user", 
+        default="postgres")
+    parser.add_argument("--postgres-password", 
+        default="postgres")
+    parser.add_argument("--postgres-database", 
+        default="postgres")
     args = parser.parse_args()
     if args.benchmark:
         test_scalability()
@@ -403,6 +424,7 @@ if __name__ == "__main__":
 
 
 class Logger:
+    #TODO: implement logging mechanism for easier debugging
 
     @classmethod
     def WARN(cls, warning: Optional[str]=None):
