@@ -73,7 +73,7 @@ class DiscoveryGraph:
     '''
     Discovery Graph class
     '''
-    def __init__(self, data_dir: str=".") -> None:
+    def __init__(self, data_dir: str=".", debug=False) -> None:
         self.graph = Graph(directed=False)
 
         self.minhash_perm = None
@@ -81,6 +81,9 @@ class DiscoveryGraph:
         self.graph.vertex_properties["profile"] = self.graph.new_vertex_property("python::object")
         self.graph.vertex_properties["minhash"] = self.graph.new_vertex_property("python::object")
         self.graph.edge_properties["profile"] = self.graph.new_edge_property("python::object")
+
+        if debug:
+            return None
 
         self.parse_dir(data_dir)
         self.make_similarity_edges()
@@ -207,12 +210,15 @@ class DiscoveryGraph:
     def find_all_paths(self, from_vertex, to_vertex):
         return topology.all_paths(self.graph, self.graph.vertex(from_vertex), self.graph.vertex(to_vertex))
 
+    def find_shortest_path(self, from_vertex, to_vertex):
+        return topology.shortest_path(self.graph, self.graph.vertex(from_vertex), self.graph.vertex(to_vertex))
+
 
 def test_graph(num_vertex, sparsity):
     '''
     Generate a random graph with given number of nodes and sparsity
     '''
-    dg = DiscoveryGraph()
+    dg = DiscoveryGraph(debug=True)
     graph = dg.graph
 
     dg.add_node_test(num_vertex)
