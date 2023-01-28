@@ -1,17 +1,17 @@
 import json
 import os
-from pathlib import Path
-import time
-from typing import Union, List
 import random
+import time
 from argparse import ArgumentParser
+from pathlib import Path
+from typing import List, Union
 
-from datasketch import MinHash, MinHashLSH
-from graph_tool import Graph, topology, search
-from graph_tool.all import graph_draw
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from datasketch import MinHash, MinHashLSH
+from graph_tool import Graph, search, topology
+from graph_tool.all import graph_draw
 from tqdm import tqdm
 from yaspin import yaspin
 
