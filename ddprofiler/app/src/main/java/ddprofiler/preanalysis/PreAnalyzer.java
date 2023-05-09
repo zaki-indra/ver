@@ -17,6 +17,7 @@ import com.opencsv.exceptions.CsvValidationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import ddprofiler.core.config.ConfigKey;
 import ddprofiler.core.config.ProfilerConfig;
 import ddprofiler.sources.Source;
 import ddprofiler.sources.deprecated.Attribute;
@@ -42,8 +43,18 @@ public class PreAnalyzer implements PreAnalysis, IO {
 
     private final static String[] BANNED = {"", "nan"};
 
+    private ArrayList<XStructType> xStructList = null;
+
     public PreAnalyzer(ProfilerConfig pc) {
         this.pc = pc;
+
+        if (pc.getBoolean("xsystem")) {
+            // TODO: Read reference file
+            String reference = pc.getString("xsystem.reference");
+            this.xStructList = (new LearningModel()).readXStructsfromJSON(reference);
+            
+        }
+        
     }
 
     /**
